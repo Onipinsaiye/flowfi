@@ -25,6 +25,9 @@ deployment-info.json
 *~
 Thumbs.db
 
+# Proptest auto-generated regression corpus — regenerated on each run, never commit
+**/proptest-regressions/
+
 # Scratch / draft markdown files — never commit
 fix.md
 issue*.md
