@@ -51,7 +51,9 @@ use events::{
     emit_initialized, emit_protocol_pause_status, emit_state_migrated,
     emit_step_vesting_stream_created, emit_stream_cancelled, emit_stream_closed,
     emit_stream_completed, emit_stream_created, emit_stream_paused, emit_stream_resumed,
-    emit_stream_topped_up, emit_tokens_withdrawn, AdminTransferredEvent,
+    emit_stream_topped_up, emit_tokens_withdrawn, emit_admin_transfer_cancelled,
+    emit_admin_transfer_proposed, AdminTransferCancelledEvent, AdminTransferProposedEvent,
+    AdminTransferredEvent,
     AllowanceStreamCreatedEvent, ContractUpgradedEvent, DisputeRequestedEvent,
     DisputeResolvedEvent, EmergencyGuardianUpdatedEvent, FeeCollectedEvent, FeeConfigUpdatedEvent,
     HybridCliffStreamCreatedEvent, InitializedEvent, MilestoneConditionUnlockedEvent,
@@ -63,7 +65,8 @@ use events::{
 use storage::{
     config_exists, get_contract_version, get_recorded_wasm_hash, load_config, load_stream,
     next_stream_id, remove_stream, save_config, save_contract_version, save_recorded_wasm_hash,
-    save_stream, try_load_config, try_load_stream,
+    save_stream, try_load_config, try_load_stream, INSTANCE_BUMP_AMOUNT,
+    INSTANCE_LIFETIME_THRESHOLD,
 };
 use types::{
     BatchStreamInput, ConditionalMilestone, DataKey, DisputeStatus, OracleAsset, OracleClient,
@@ -391,7 +394,7 @@ impl StreamContract {
         if duration == 0 {
             return Err(StreamError::InvalidDuration);
         }
-        Self::validate_token_contract(&env, &token_address)?;
+        validate_token(&env, &token_address)?;
 
         let stream_id = next_stream_id(&env);
         let start_time = env.ledger().timestamp();
@@ -864,7 +867,7 @@ impl StreamContract {
         if amount <= 0 {
             return Err(StreamError::InvalidAmount);
         }
-        Self::validate_token_contract(&env, &token_address)?;
+        validate_token(&env, &token_address)?;
 
         let step_count = steps.len();
         if step_count == 0 {
@@ -967,7 +970,7 @@ impl StreamContract {
         if linear_duration == 0 {
             return Err(StreamError::InvalidCliffParameters);
         }
-        Self::validate_token_contract(&env, &token_address)?;
+        validate_token(&env, &token_address)?;
 
         let stream_id = next_stream_id(&env);
         let start_time = env.ledger().timestamp();
@@ -2712,4 +2715,150 @@ impl StreamContract {
             );
         }
     }
+
+    // ─── TTL Renewal ──────────────────────────────────────────────────────────
+
+    /// Renews the TTL of an active stream's persistent storage to prevent archival.
+    ///
+    /// This may be called by anyone — keepers, the sender, the recipient, or a
+    /// third-party cron job — because the operation is read-only with respect to
+    /// stream state; it only extends the storage lifetime.
+    ///
+    /// Terminal streams (Cancelled, Completed) are intentionally skipped: the
+    /// archival policy for settled records is deliberate.
+    ///
+    /// # Errors
+    /// - `StreamNotFound` — no stream exists at `stream_id`.
+    pub fn renew_stream_ttl(env: Env, stream_id: u64) -> Result<(), StreamError> {
+        // Verify the stream exists before renewing
+        let stream = load_stream(&env, stream_id)?;
+        // Only renew active/paused streams — terminal records should archive
+        match stream.status {
+            StreamStatus::Active | StreamStatus::Paused => {
+                storage::renew_stream_ttl(&env, stream_id);
+                // Also bump instance TTL since config is read on every call
+                env.storage()
+                    .instance()
+                    .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+            }
+            StreamStatus::Cancelled | StreamStatus::Completed => {
+                // Terminal: do not extend — let archival proceed naturally
+            }
+        }
+        Ok(())
+    }
+
+    // ─── Two-Step Admin Transfer ──────────────────────────────────────────────
+
+    /// Proposes a two-step admin transfer to `new_admin`.
+    ///
+    /// The transfer is not complete until `new_admin` calls `accept_admin_transfer`.
+    /// Proposing while a previous proposal is pending replaces the pending address.
+    /// Only the current admin may call this.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — protocol not yet initialized.
+    /// - `Unauthorized` — caller is not the current admin.
+    pub fn propose_admin_transfer(env: Env, new_admin: Address) -> Result<(), StreamError> {
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        emit_admin_transfer_proposed(
+            &env,
+            AdminTransferProposedEvent {
+                current_admin: config.admin,
+                proposed_admin: new_admin,
+            },
+        );
+        Ok(())
+    }
+
+    /// Accepts a pending admin transfer, making the caller the new admin.
+    ///
+    /// Only the address previously proposed by `propose_admin_transfer` may call
+    /// this. On success, the pending transfer is cleared and `admin_transferred`
+    /// is emitted with the same payload as the legacy immediate transfer.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — protocol not yet initialized.
+    /// - `Unauthorized` — no pending transfer, or caller is not the pending admin.
+    pub fn accept_admin_transfer(env: Env) -> Result<(), StreamError> {
+        let mut config = load_config(&env)?;
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin);
+        let pending_admin = pending.ok_or(StreamError::Unauthorized)?;
+        pending_admin.require_auth();
+        let previous_admin = config.admin.clone();
+        config.admin = pending_admin;
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        save_config(&env, &config);
+        emit_admin_transferred(
+            &env,
+            AdminTransferredEvent {
+                previous_admin,
+                new_admin: config.admin,
+            },
+        );
+        Ok(())
+    }
+
+    /// Cancels a pending admin transfer.
+    ///
+    /// Only the current admin may cancel. Calling this when no transfer is pending
+    /// is a no-op (returns `Ok`).
+    ///
+    /// # Errors
+    /// - `NotInitialized` — protocol not yet initialized.
+    /// - `Unauthorized` — caller is not the current admin.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), StreamError> {
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin);
+        if let Some(cancelled) = pending {
+            env.storage().instance().remove(&DataKey::PendingAdmin);
+            emit_admin_transfer_cancelled(
+                &env,
+                AdminTransferCancelledEvent {
+                    admin: config.admin,
+                    cancelled_proposed_admin: cancelled,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Validates that `token_address` points to a token contract implementing
+/// the SEP-0041 interface by attempting a `balance` query against it.
+///
+/// A fresh contract address that is not a token will fail the cross-contract
+/// call. An address that encodes an invalid Stellar account format or an
+/// unknown contract will also fail here rather than at the token transfer,
+/// ensuring the caller gets a clean `IncompatibleToken` error instead of an
+/// opaque host error.
+///
+/// # Errors
+/// - `IncompatibleToken` — the token contract is missing, rejected the call,
+///   or the address is structurally invalid.
+fn validate_token(env: &Env, token_address: &Address) -> Result<(), StreamError> {
+    // Attempt to read the contract's own balance as a presence check.
+    // `token::Client::balance` is the lightest SEP-0041 call available;
+    // a non-token contract or an absent contract will trap here.
+    let client = token::Client::new(env, token_address);
+    // Use the contract's own address as the subject of the balance query;
+    // the value itself is irrelevant — we only care that the call does not
+    // trap.
+    let _balance = client.try_balance(&env.current_contract_address())
+        .map_err(|_| StreamError::IncompatibleToken)?;
+    Ok(())
 }

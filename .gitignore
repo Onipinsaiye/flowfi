@@ -25,9 +25,32 @@ deployment-info.json
 *~
 Thumbs.db
 
+# Proptest auto-generated regression corpus — regenerated on each run, never commit
+**/proptest-regressions/
+
 # Scratch / draft markdown files — never commit
 fix.md
 issue*.md
 pr*.md
 ISSUE_*.md
 PR_*.md
+
+# Property-based test regression cases — auto-generated
+**/proptest-regressions/
+
+# Local environment overrides — never commit
+.env.local
+.env.*.local
+
+# Test snapshot files
+*.snap
+**/__snapshots__/
+
+# Merge artifacts
+*.orig
+
+# Local Cargo registry cache
+.cargo/
+
+# Rust build artifacts (all workspace members)
+**/target/

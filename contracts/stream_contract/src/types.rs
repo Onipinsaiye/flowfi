@@ -196,6 +196,10 @@ pub enum DataKey {
     /// Emitted `OracleAttestation` ids for one stream (instance storage),
     /// so a attestation cannot unlock two milestones.
     AttestedIds(u64),
+    /// Pending admin address awaiting acceptance of a two-step transfer.
+    /// Set by `propose_admin_transfer`, cleared by `accept_admin_transfer` or
+    /// `cancel_admin_transfer`.
+    PendingAdmin,
 }
 
 /// Immutable state of a payment stream.
