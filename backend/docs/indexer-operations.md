@@ -2,9 +2,10 @@
 
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
-admin replay preview/execute contract, and the indexer metrics. It is written
-for operators and on-call engineers. All public interfaces described here are
-additive; existing endpoints and configuration keys keep working unless noted.
+admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
+and the indexer metrics. It is written for operators and on-call engineers.
+All public interfaces described here are additive; existing endpoints and
+configuration keys keep working unless noted.
 
 ---
 
@@ -156,7 +157,68 @@ response is a **report** with the following fields:
 
 ---
 
-## 4. Metrics
+## 4. Soroban RPC retry and backoff policy
+
+### Behavior
+
+All Soroban RPC calls made by the indexer polling path go through a single
+centralized retry/backoff policy. Ad-hoc per-call retry loops are replaced by
+this policy so classification, bounds, and diagnostics are consistent.
+
+- **Error classification.** Each failure is classified before deciding to
+  retry:
+  - **Retryable:** transient network failures (connection reset, timeout,
+    DNS/transport errors), rate-limit responses (HTTP `429`), and server
+    errors (HTTP `5xx`).
+  - **Permanent (fail fast):** decoding failures (malformed/unexpected
+    response payloads) and authorization failures (HTTP `401`/`403`). These
+    are surfaced immediately without consuming retry budget.
+- **Bounded attempts.** The policy caps the number of attempts per RPC call.
+  Once exhausted, the call fails with a structured error rather than looping.
+- **Bounded total duration.** The policy also caps the total wall-clock time
+  spent retrying a single call, so a persistently failing endpoint cannot
+  stall the poll loop indefinitely.
+- **Jittered exponential backoff.** Delay between attempts grows
+  exponentially from a configured minimum up to a configured maximum, with
+  jitter applied so replicas do not retry in lockstep. Delays never fall below
+  the minimum or exceed the maximum bound.
+- **Cancellation.** The policy honors an abort signal (shutdown or lease
+  loss). On cancellation, retries stop promptly and the call fails with a
+  cancellation error.
+
+### Externally observable effects
+
+- Transient, rate-limit, and server errors are retried within the configured
+  attempt and duration bounds; permanent decoding/authorization errors fail
+  immediately.
+- **The cursor is not advanced when retries are exhausted or cancelled.** A
+  ledger is only committed after its RPC fetch succeeds, so a failed poll
+  leaves the cursor at the last successfully indexed ledger and the next poll
+  resumes from there.
+- Retry attempts are counted with a bounded `reason` label (see metrics).
+
+### Configuration
+
+| Key | Meaning | Notes |
+| --- | --- | --- |
+| `INDEXER_RPC_MAX_ATTEMPTS` | Max attempts per RPC call | Includes the first attempt |
+| `INDEXER_RPC_MAX_TOTAL_MS` | Max total retry duration per call | Bounds worst-case stall |
+| `INDEXER_RPC_BACKOFF_MIN_MS` | Minimum backoff delay | Lower bound for jittered delay |
+| `INDEXER_RPC_BACKOFF_MAX_MS` | Maximum backoff delay | Upper bound for jittered delay |
+
+### Rollout and migration
+
+- The policy is internal to the indexer; no public RPC or admin interfaces
+  change. Existing configuration keys keep working; the new keys above have
+  safe defaults.
+- **Rollout:** deploy normally. Because the cursor is only advanced on
+  success, a rolling upgrade does not risk skipping ledgers.
+- **Rollback:** reverting restores prior retry behavior; no data migration is
+  required.
+
+---
+
+## 5. Metrics
 
 All metrics are emitted per worker instance and are safe with multiple
 replicas. **No high-cardinality labels** (transaction hashes, wallet
@@ -170,24 +232,4 @@ addresses) are used.
 | `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
 | `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
 | `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | 1 if this worker currently holds the lease |
-| `indexer_lease_fenced_writes_total` | counter | count | `worker` | Cursor writes rejected due to stale fencing |
-
-### Multi-worker semantics
-
-- Each worker reports its own series, distinguished by the `worker` label
-  (owner ID). Aggregate across workers for cluster-wide views.
-- `indexer_lease_owner` sums to 1 across healthy workers (exactly one active
-  owner). A sum of 0 indicates no active owner (takeover in progress or all
-  workers down); a sum greater than 1 indicates a coordination fault.
-- `indexer_ledger_lag` and `indexer_last_success_timestamp_seconds` should be
-  read from the worker with `indexer_lease_owner == 1`.
-- `indexer_lease_fenced_writes_total` increasing indicates a former owner is
-  still attempting writes — investigate for split-brain or slow takeover.
-
-### Suggested alerts
-
-- `indexer_ledger_lag` sustained above threshold on the active owner.
-- `sum(indexer_lease_owner) != 1` for longer than one TTL.
-- `indexer_last_success_timestamp_seconds` not advancing.
-- `rate(indexer_lease_fenced_writes_total[5m]) > 0`.
+| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
