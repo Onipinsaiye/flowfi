@@ -3,9 +3,10 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-and the indexer metrics. It is written for operators and on-call engineers.
-All public interfaces described here are additive; existing endpoints and
-configuration keys keep working unless noted.
+graceful shutdown and poll cancellation, and the indexer metrics. It is
+written for operators and on-call engineers. All public interfaces described
+here are additive; existing endpoints and configuration keys keep working
+unless noted.
 
 ---
 
@@ -174,62 +175,62 @@ this policy so classification, bounds, and diagnostics are consistent.
     response payloads) and authorization failures (HTTP `401`/`403`). These
     are surfaced immediately without consuming retry budget.
 - **Bounded attempts.** The policy caps the number of attempts per RPC call.
-  Once exhausted, the call fails with a structured error rather than looping.
-- **Bounded total duration.** The policy also caps the total wall-clock time
-  spent retrying a single call, so a persistently failing endpoint cannot
-  stall the poll loop indefinitely.
-- **Jittered exponential backoff.** Delay between attempts grows
-  exponentially from a configured minimum up to a configured maximum, with
-  jitter applied so replicas do not retry in lockstep. Delays never fall below
-  the minimum or exceed the maximum bound.
-- **Cancellation.** The policy honors an abort signal (shutdown or lease
-  loss). On cancellation, retries stop promptly and the call fails with a
-  cancellation error.
-
-### Externally observable effects
-
-- Transient, rate-limit, and server errors are retried within the configured
-  attempt and duration bounds; permanent decoding/authorization errors fail
-  immediately.
-- **The cursor is not advanced when retries are exhausted or cancelled.** A
-  ledger is only committed after its RPC fetch succeeds, so a failed poll
-  leaves the cursor at the last successfully indexed ledger and the next poll
-  resumes from there.
-- Retry attempts are counted with a bounded `reason` label (see metrics).
-
-### Configuration
-
-| Key | Meaning | Notes |
-| --- | --- | --- |
-| `INDEXER_RPC_MAX_ATTEMPTS` | Max attempts per RPC call | Includes the first attempt |
-| `INDEXER_RPC_MAX_TOTAL_MS` | Max total retry duration per call | Bounds worst-case stall |
-| `INDEXER_RPC_BACKOFF_MIN_MS` | Minimum backoff delay | Lower bound for jittered delay |
-| `INDEXER_RPC_BACKOFF_MAX_MS` | Maximum backoff delay | Upper bound for jittered delay |
-
-### Rollout and migration
-
-- The policy is internal to the indexer; no public RPC or admin interfaces
-  change. Existing configuration keys keep working; the new keys above have
-  safe defaults.
-- **Rollout:** deploy normally. Because the cursor is only advanced on
-  success, a rolling upgrade does not risk skipping ledgers.
-- **Rollback:** reverting restores prior retry behavior; no data migration is
-  required.
+  Once exhausted, the call fails with a structured error rather than
+  retrying indefinitely.
+- **Exponential backoff with jitter.** Retries use exponential backoff with
+  randomized jitter to avoid synchronized retry storms across replicas.
+- **Cancellation-aware.** Retry waits observe the worker's shutdown signal;
+  a shutdown aborts pending backoff sleeps and in-flight RPC calls promptly
+  instead of waiting out the full retry budget.
 
 ---
 
-## 5. Metrics
+## 5. Graceful shutdown and poll cancellation
 
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
+### Behavior
 
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+The indexer handles `SIGTERM` and `SIGINT` by initiating a **graceful
+shutdown** rather than terminating mid-batch. A single cancellation signal is
+shared by the poll loop and the Soroban event worker.
+
+- **Stop acquiring new ranges.** Once shutdown is requested, the poll loop
+  stops acquiring new ledger ranges. It finishes (or safely abandons) the
+  in-flight batch and then exits cleanly.
+- **Cancellation-aware RPC fetch.** If shutdown occurs during an RPC fetch,
+  the fetch is aborted and the batch is abandoned **without advancing the
+  checkpoint**. The next start re-fetches the same range.
+- **Cancellation-aware persistence.** If shutdown occurs during database
+  persistence, the checkpoint is advanced **only after the transaction
+  commits**. A batch that is rolled back leaves the cursor unchanged, so the
+  next start re-processes the same range.
+- **Idempotent restart.** Re-processing an abandoned range relies on existing
+  unique constraints / upserts, so a restart after an abandoned batch does not
+  produce duplicate side effects.
+
+### Externally observable effects
+
+- A shutdown during RPC fetch or during persistence restarts without skipped
+  ledgers or duplicate side effects.
+- The persisted cursor only ever reflects committed progress; it never points
+  past a batch that was not fully committed.
+- Shutdown completes within the configured grace period; in-flight work is
+  abandoned safely rather than left half-applied.
+
+### Operational notes
+
+- Send `SIGTERM` (the default for orchestrator scale-down) and allow the grace
+  period to elapse before `SIGKILL`.
+- No configuration keys or public interfaces changed; shutdown behavior is
+  additive and requires no migration.
+- **Rollout:** safe to deploy in a rolling fashion; each replica drains its
+  in-flight batch on shutdown and the lease ensures a single active owner.
+
+---
+
+## 6. Indexer metrics
+
+Metrics are emitted for lease acquisition/renewal, cursor advances, rejected
+stale writes, RPC retries by classification, and shutdown events (requested,
+completed, and batches abandoned). Use these to alert on repeated stale-write
+rejections, sustained RPC retry exhaustion, or shutdowns that do not complete
+within the grace period.
