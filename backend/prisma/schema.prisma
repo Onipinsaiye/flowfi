@@ -57,11 +57,21 @@ model Stream {
   @@index([isPaused])
 }
 
-// IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker
+// IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker.
+//
+// Concurrency contract (issue #43): replay, reset, and normal polling all mutate
+// this single row. Writers MUST take a row-level lock (SELECT ... FOR UPDATE) on
+// the singleton row inside a transaction before reading or advancing the cursor,
+// so an admin replay cannot race the live worker or move the cursor backwards.
+// The `version` column is an optimistic-concurrency guard: every write bumps it
+// and callers that observed a stale version must retry. `lastCursor` is only ever
+// advanced monotonically (never regressed) by the poll loop; replay/reset are the
+// only operations allowed to rewind it, and they do so under the same lock.
 model IndexerState {
   id          String   @id @default("singleton")
   lastLedger  Int      @default(0)
   lastCursor  String?  // Paging token of the last processed event (for cursor-based pagination)
+  version     Int      @default(0) // Optimistic-concurrency guard; bumped on every write
   updatedAt   DateTime @updatedAt
 }
 
@@ -207,7 +217,6 @@ model BackfillJob {
 enum BackfillStatus {
   PENDING
   RUNNING
-  PAUSED
   COMPLETED
   FAILED
   CANCELLED
