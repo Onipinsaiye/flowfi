@@ -146,6 +146,32 @@ response is a **report** with the following fields:
   live cursor is not advanced past the last successfully applied ledger, and
   `failurePosition` identifies where it stopped. Retry resumes from there.
 
+### Concurrency: replay vs. live polling
+
+Replay, reset, and normal polling all mutate the same shared cursor and event
+state, so they are **serialized** against each other. The serialization is
+enforced at the database layer (a transaction-scoped advisory lock keyed on the
+indexer cursor row), not in process memory, so it holds **across multiple
+backend instances**.
+
+- **Mutual exclusion.** While a replay (or reset) holds the lock, the live
+  worker cannot advance the cursor; while the live worker holds it, replay
+  waits. Operations queue rather than interleave.
+- **Monotonic cursor.** The cursor never moves backwards as a result of a
+  replay overlapping a poll. A replay that would move the cursor behind the
+  live position is rejected (reported as `status: failed` with a clear
+  message) instead of silently rewinding it.
+- **Deterministic event state.** Because replay and polling never run
+  concurrently, the resulting event state for a given starting state and
+  inputs is deterministic regardless of which replica handled the poll or the
+  replay.
+- **Fencing still applies.** A replay executed by a replica that does not hold
+  the poll lease still writes through the same fenced cursor path; a stale
+  lease owner cannot use replay to bypass fencing.
+- **Lock timeout.** If the lock cannot be acquired within the configured
+  timeout, the operation fails fast with `status: failed` rather than blocking
+  indefinitely; retry is safe.
+
 ### Operational notes
 
 - Preview before execute to confirm the affected range and expected changes.
@@ -153,6 +179,8 @@ response is a **report** with the following fields:
   before retrying.
 - No existing admin endpoints were removed; the report is additive to the
   replay response.
+- Replay briefly pauses live polling while it holds the lock; expect a small,
+  bounded lag increase during a replay window.
 
 ---
 
@@ -170,24 +198,4 @@ addresses) are used.
 | `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
 | `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
 | `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | 1 if this worker currently holds the lease |
-| `indexer_lease_fenced_writes_total` | counter | count | `worker` | Cursor writes rejected due to stale fencing |
-
-### Multi-worker semantics
-
-- Each worker reports its own series, distinguished by the `worker` label
-  (owner ID). Aggregate across workers for cluster-wide views.
-- `indexer_lease_owner` sums to 1 across healthy workers (exactly one active
-  owner). A sum of 0 indicates no active owner (takeover in progress or all
-  workers down); a sum greater than 1 indicates a coordination fault.
-- `indexer_ledger_lag` and `indexer_last_success_timestamp_seconds` should be
-  read from the worker with `indexer_lease_owner == 1`.
-- `indexer_lease_fenced_writes_total` increasing indicates a former owner is
-  still attempting writes — investigate for split-brain or slow takeover.
-
-### Suggested alerts
-
-- `indexer_ledger_lag` sustained above threshold on the active owner.
-- `sum(indexer_lease_owner) != 1` for longer than one TTL.
-- `indexer_last_success_timestamp_seconds` not advancing.
-- `rate(indexer_lease_fenced_writes_total[5m]) > 0`.
+| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
