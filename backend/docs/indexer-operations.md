@@ -148,6 +148,32 @@ response is a **report** with the following fields:
   live cursor is not advanced past the last successfully applied ledger, and
   `failurePosition` identifies where it stopped. Retry resumes from there.
 
+### Concurrency: replay vs. live polling
+
+Replay, reset, and normal polling all mutate the same shared cursor and event
+state, so they are **serialized** against each other. The serialization is
+enforced at the database layer (a transaction-scoped advisory lock keyed on the
+indexer cursor row), not in process memory, so it holds **across multiple
+backend instances**.
+
+- **Mutual exclusion.** While a replay (or reset) holds the lock, the live
+  worker cannot advance the cursor; while the live worker holds it, replay
+  waits. Operations queue rather than interleave.
+- **Monotonic cursor.** The cursor never moves backwards as a result of a
+  replay overlapping a poll. A replay that would move the cursor behind the
+  live position is rejected (reported as `status: failed` with a clear
+  message) instead of silently rewinding it.
+- **Deterministic event state.** Because replay and polling never run
+  concurrently, the resulting event state for a given starting state and
+  inputs is deterministic regardless of which replica handled the poll or the
+  replay.
+- **Fencing still applies.** A replay executed by a replica that does not hold
+  the poll lease still writes through the same fenced cursor path; a stale
+  lease owner cannot use replay to bypass fencing.
+- **Lock timeout.** If the lock cannot be acquired within the configured
+  timeout, the operation fails fast with `status: failed` rather than blocking
+  indefinitely; retry is safe.
+
 ### Operational notes
 
 - Preview before execute to confirm the affected range and expected changes.
@@ -155,82 +181,23 @@ response is a **report** with the following fields:
   before retrying.
 - No existing admin endpoints were removed; the report is additive to the
   replay response.
+- Replay briefly pauses live polling while it holds the lock; expect a small,
+  bounded lag increase during a replay window.
 
 ---
 
-## 4. Soroban RPC retry and backoff policy
+## 4. Metrics
 
-### Behavior
+All metrics are emitted per worker instance and are safe with multiple
+replicas. **No high-cardinality labels** (transaction hashes, wallet
+addresses) are used.
 
-All Soroban RPC calls made by the indexer polling path go through a single
-centralized retry/backoff policy. Ad-hoc per-call retry loops are replaced by
-this policy so classification, bounds, and diagnostics are consistent.
-
-- **Error classification.** Each failure is classified before deciding to
-  retry:
-  - **Retryable:** transient network failures (connection reset, timeout,
-    DNS/transport errors), rate-limit responses (HTTP `429`), and server
-    errors (HTTP `5xx`).
-  - **Permanent (fail fast):** decoding failures (malformed/unexpected
-    response payloads) and authorization failures (HTTP `401`/`403`). These
-    are surfaced immediately without consuming retry budget.
-- **Bounded attempts.** The policy caps the number of attempts per RPC call.
-  Once exhausted, the call fails with a structured error rather than
-  retrying indefinitely.
-- **Exponential backoff with jitter.** Retries use exponential backoff with
-  randomized jitter to avoid synchronized retry storms across replicas.
-- **Cancellation-aware.** Retry waits observe the worker's shutdown signal;
-  a shutdown aborts pending backoff sleeps and in-flight RPC calls promptly
-  instead of waiting out the full retry budget.
-
----
-
-## 5. Graceful shutdown and poll cancellation
-
-### Behavior
-
-The indexer handles `SIGTERM` and `SIGINT` by initiating a **graceful
-shutdown** rather than terminating mid-batch. A single cancellation signal is
-shared by the poll loop and the Soroban event worker.
-
-- **Stop acquiring new ranges.** Once shutdown is requested, the poll loop
-  stops acquiring new ledger ranges. It finishes (or safely abandons) the
-  in-flight batch and then exits cleanly.
-- **Cancellation-aware RPC fetch.** If shutdown occurs during an RPC fetch,
-  the fetch is aborted and the batch is abandoned **without advancing the
-  checkpoint**. The next start re-fetches the same range.
-- **Cancellation-aware persistence.** If shutdown occurs during database
-  persistence, the checkpoint is advanced **only after the transaction
-  commits**. A batch that is rolled back leaves the cursor unchanged, so the
-  next start re-processes the same range.
-- **Idempotent restart.** Re-processing an abandoned range relies on existing
-  unique constraints / upserts, so a restart after an abandoned batch does not
-  produce duplicate side effects.
-
-### Externally observable effects
-
-- A shutdown during RPC fetch or during persistence restarts without skipped
-  ledgers or duplicate side effects.
-- The persisted cursor only ever reflects committed progress; it never points
-  past a batch that was not fully committed.
-- Shutdown completes within the configured grace period; in-flight work is
-  abandoned safely rather than left half-applied.
-
-### Operational notes
-
-- Send `SIGTERM` (the default for orchestrator scale-down) and allow the grace
-  period to elapse before `SIGKILL`.
-- No configuration keys or public interfaces changed; shutdown behavior is
-  additive and requires no migration.
-- **Rollout:** safe to deploy in a rolling fashion; each replica drains its
-  in-flight batch on shutdown and the lease ensures a single active owner.
-
----
-
-## 6. Indexer metrics
-
-Metrics are emitted for lease acquisition/renewal, cursor advances, rejected
-stale writes, RPC retries by classification, and shutdown events (requested,
-completed, and batches abandoned). Use these to alert on repeated stale-write
-rejections, sustained RPC retry exhaustion, or shutdowns that do not complete
-within the grace period.
+| Metric | Type | Unit | Labels | Meaning |
+| --- | --- | --- | --- | --- |
+| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
+| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
+| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
+| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
+| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
+| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
+| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
